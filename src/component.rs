@@ -207,9 +207,17 @@ impl<H: ComponentHandler> Component<H> {
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
         reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     ) -> Result<()> {
-        // Build REGISTER payload
+        // Build REGISTER payload.
+        // Prefer the value set in Config; fall back to AEGIS_SESSION_TOKEN env
+        // var injected by the Aegis daemon — mirrors the Go SDK behaviour.
+        let session_token = if !self.cfg.session_token.is_empty() {
+            self.cfg.session_token.clone()
+        } else {
+            std::env::var("AEGIS_SESSION_TOKEN").unwrap_or_default()
+        };
+
         let mut payload = HashMap::new();
-        payload.insert("session_token".into(),  Value::String(self.cfg.session_token.clone()));
+        payload.insert("session_token".into(), Value::String(session_token));
         payload.insert("component_name".into(), Value::String(self.cfg.component_name.clone()));
         payload.insert("version".into(),        Value::String(self.cfg.version.clone()));
 
