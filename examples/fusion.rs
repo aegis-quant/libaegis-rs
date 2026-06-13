@@ -1,5 +1,4 @@
-//! Aegis component — works in both historical and realtime sessions.
-//!
+//! Unified component that works in both historical and realtime sessions.
 //! Set `AEGIS_MODE=historical` or `AEGIS_MODE=realtime` (default: realtime).
 //!
 //! Data availability per mode:
@@ -14,37 +13,30 @@
 //! | metrics     |     ✓      |    –     |
 
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use libaegis::{Component, ComponentHandler, Config, DataStream, StreamMessage};
 use libaegis::data_stream::{MarketData, OrderBook};
 use libaegis::error::Result;
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
-use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Mode
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Realtime,
-    Historical,
-}
+enum Mode { Realtime, Historical }
 
 impl Mode {
     fn from_env() -> Self {
         match std::env::var("AEGIS_MODE").as_deref() {
             Ok("realtime") => Mode::Realtime,
-            _                => Mode::Historical,
+            _              => Mode::Historical,
         }
     }
-
     fn as_str(self) -> &'static str {
-        match self {
-            Mode::Realtime   => "realtime",
-            Mode::Historical => "historical",
-        }
+        match self { Mode::Realtime => "realtime", Mode::Historical => "historical" }
     }
 }
 
@@ -52,29 +44,24 @@ impl Mode {
 // Handler
 // ---------------------------------------------------------------------------
 
-struct ComponentHandlerImpl {
+struct FusionHandler {
     socket_path: Arc<Mutex<String>>,
     mode:        Mode,
 }
 
-impl ComponentHandlerImpl {
+impl FusionHandler {
     fn new(mode: Mode) -> Self {
-        Self {
-            socket_path: Arc::new(Mutex::new(String::new())),
-            mode,
-        }
+        Self { socket_path: Arc::new(Mutex::new(String::new())), mode }
     }
 }
 
-impl ComponentHandler for ComponentHandlerImpl {
+impl ComponentHandler for FusionHandler {
     async fn on_configure(&self, socket_path: String, topics: Vec<String>) -> Result<()> {
         info!(socket = %socket_path, ?topics, mode = self.mode.as_str(), "configure");
         *self.socket_path.lock().await = socket_path;
         Ok(())
     }
 
-    // component_id and session_id are passed directly by the SDK — populated
-    // from the REGISTERED response. No need to store or seed them manually.
     async fn on_running(
         &self,
         component_id: String,
@@ -82,31 +69,24 @@ impl ComponentHandler for ComponentHandlerImpl {
         shutdown:     CancellationToken,
     ) -> Result<()> {
         info!(%component_id, %session_id, mode = self.mode.as_str(), "running");
-
         let socket = self.socket_path.lock().await.clone();
         let mode   = self.mode;
-
         tokio::spawn(async move {
             stream_worker(socket, component_id, session_id, mode, shutdown).await;
         });
-
         Ok(())
     }
 
+    // Called when a FINISHED session is restarted. Reset ALL per-run state.
+    // on_running is NOT called again — the task above keeps running.
     async fn on_reborn(&self) {
-        // Reset ALL per-run state here — counters, positions, buffers, etc.
-        // on_running is NOT called again; the existing worker task keeps running
-        // and will receive data from the new orchestrator automatically.
         info!("reborn — resetting per-run state");
+        // TODO: reset indicators, positions, counters, etc.
     }
 
-    async fn on_ping(&self) {
-        tracing::debug!("ping");
-    }
+    async fn on_ping(&self) { tracing::debug!("ping"); }
 
-    async fn on_shutdown(&self) {
-        info!("shutdown — releasing resources");
-    }
+    async fn on_shutdown(&self) { info!("shutdown"); }
 
     async fn on_error(&self, code: String, message: String) {
         tracing::error!(%code, %message, "aegis error");
@@ -125,24 +105,20 @@ async fn stream_worker(
     shutdown:     CancellationToken,
 ) {
     'outer: loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
+        if shutdown.is_cancelled() { break; }
 
         let mut stream = loop {
-            if shutdown.is_cancelled() {
-                break 'outer;
-            }
+            if shutdown.is_cancelled() { break 'outer; }
             match DataStream::connect(&socket_path, &component_id, &session_id).await {
                 Ok(s) => {
                     info!(topics = ?s.topics, "data stream connected");
                     break s;
                 }
                 Err(e) => {
-                    tracing::warn!("data stream connect error: {e} — retrying in 1s");
+                    tracing::warn!("data stream connect failed: {e} — retrying in 1s");
                     tokio::select! {
-                        _ = shutdown.cancelled()                                      => break 'outer,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1))    => {}
+                        _ = shutdown.cancelled()                                          => break 'outer,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1))        => {}
                     }
                 }
             }
@@ -155,7 +131,7 @@ async fn stream_worker(
                     match result {
                         Ok((msg, data)) => handle_message(msg, data, mode).await,
                         Err(e) => {
-                            tracing::warn!("data stream closed: {e} — reconnecting");
+                            tracing::warn!("data stream error: {e} — reconnecting");
                             break;
                         }
                     }
@@ -168,7 +144,6 @@ async fn stream_worker(
             _ = tokio::time::sleep(std::time::Duration::from_millis(500))         => {}
         }
     }
-
     info!("stream worker stopped");
 }
 
@@ -179,25 +154,22 @@ async fn stream_worker(
 async fn handle_message(msg: StreamMessage, data: MarketData, mode: Mode) {
     let parts = match msg.topic_parts() {
         Some(p) => p,
-        None => {
-            tracing::warn!(topic = %msg.topic, "unparseable topic");
-            return;
-        }
+        None => { tracing::warn!(topic = %msg.topic, "unparseable topic"); return; }
     };
 
     match data {
         // ── Common to both modes ─────────────────────────────────────────────
 
         MarketData::AggTrade(t) => {
-            // historical: event_time == 0, symbol == "". Use transact_time always.
+            // historical: event_time == 0, symbol == "". Always use transact_time.
             info!(
-                symbol      = %parts.symbol,
-                ts          = t.transact_time,
-                price       = t.price,
-                qty         = t.quantity,
-                normal_qty  = t.normal_qty,   // 0 in historical mode
-                is_maker    = t.is_buyer_maker,
-                realtime    = t.is_realtime(),
+                symbol     = %parts.symbol,
+                ts         = t.transact_time,
+                price      = t.price,
+                qty        = t.quantity,
+                normal_qty = t.normal_qty,   // 0 in historical
+                is_maker   = t.is_buyer_maker,
+                realtime   = t.is_realtime(),
                 "aggTrade",
             );
         }
@@ -214,16 +186,15 @@ async fn handle_message(msg: StreamMessage, data: MarketData, mode: Mode) {
         }
 
         MarketData::Kline(k) => {
-            let timeframe = parts.timeframe.as_deref().unwrap_or("?");
             info!(
-                symbol    = %parts.symbol,
-                timeframe = timeframe,
-                ts        = k.open_time,
-                open      = k.open,
-                high      = k.high,
-                low       = k.low,
-                close     = k.close,
-                volume    = k.volume,
+                symbol = %parts.symbol,
+                tf     = parts.timeframe.as_deref().unwrap_or("?"),
+                ts     = k.open_time,
+                o      = k.open,
+                h      = k.high,
+                l      = k.low,
+                c      = k.close,
+                vol    = k.volume,
                 "kline",
             );
         }
@@ -246,11 +217,11 @@ async fn handle_message(msg: StreamMessage, data: MarketData, mode: Mode) {
                 return;
             }
             info!(
-                symbol     = %parts.symbol,
-                ts         = bd.timestamp,
-                percentage = bd.percentage,
-                depth      = bd.depth,
-                notional   = bd.notional,
+                symbol  = %parts.symbol,
+                ts      = bd.timestamp,
+                pct     = bd.percentage,
+                depth   = bd.depth,
+                notional = bd.notional,
                 "bookDepth",
             );
         }
@@ -261,23 +232,19 @@ async fn handle_message(msg: StreamMessage, data: MarketData, mode: Mode) {
                 return;
             }
             info!(
-                symbol       = %parts.symbol,
-                ts           = m.create_time,
-                oi           = m.sum_open_interest,
-                oi_value     = m.sum_open_interest_value,
-                long_short   = m.count_long_short_ratio,
+                symbol   = %parts.symbol,
+                ts       = m.create_time,
+                oi       = m.sum_open_interest,
+                oi_value = m.sum_open_interest_value,
+                ls_ratio = m.count_long_short_ratio,
                 "metrics",
             );
         }
 
-        // ── Forward-compat ───────────────────────────────────────────────────
+        // ── Forward compatibility ────────────────────────────────────────────
 
         MarketData::Unknown { data_type, .. } => {
-            tracing::warn!(
-                topic     = %msg.topic,
-                data_type = %data_type,
-                "unknown data type — SDK may need updating",
-            );
+            tracing::warn!(topic = %msg.topic, %data_type, "unknown data type — SDK may need updating");
         }
     }
 }
@@ -287,27 +254,24 @@ fn handle_order_book(symbol: &str, envelope_ts: i64, ob: OrderBook) {
         tracing::debug!(
             symbol         = symbol,
             last_update_id = ob.last_update_id,
-            "orderBook — spot stream (no real timestamp, using last_update_id)",
+            "orderBook — spot stream (using last_update_id as timestamp proxy)",
         );
     }
-
     match (ob.best_bid(), ob.best_ask()) {
         (Some(bid), Some(ask)) => {
-            let spread = ask.price - bid.price;
-            let mid    = ob.mid_price().unwrap_or(0.0);
             info!(
-                symbol    = symbol,
-                ts        = envelope_ts,
-                bid       = bid.price,
-                ask       = ask.price,
-                spread    = spread,
-                mid_price = mid,
-                bid_depth = ob.bids.len(),
-                ask_depth = ob.asks.len(),
+                symbol     = symbol,
+                ts         = envelope_ts,
+                bid        = bid.price,
+                ask        = ask.price,
+                spread     = ask.price - bid.price,
+                mid        = ob.mid_price().unwrap_or(0.0),
+                bid_levels = ob.bids.len(),
+                ask_levels = ob.asks.len(),
                 "orderBook",
             );
         }
-        _ => tracing::warn!(symbol = symbol, "orderBook snapshot has empty bids or asks"),
+        _ => tracing::warn!(symbol = symbol, "orderBook snapshot has empty side"),
     }
 }
 
@@ -322,20 +286,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "libaegis=debug,market_data=info".into())
+                .unwrap_or_else(|_| "libaegis=debug,fusion=info".into())
         )
         .init();
 
     info!(mode = mode.as_str(), "starting component");
 
-    // socket_path falls back to AEGIS_SOCKET env var inside Config::new when
-    // passed as empty string — or you can pass it explicitly here.
-    // session_token is injected by the Aegis daemon via AEGIS_SESSION_TOKEN
-    // and read inside component.rs register() — pass "" here, same as Go SDK.
-    let socket_path = std::env::var("AEGIS_SOCKET")
+    let socket_path   = std::env::var("AEGIS_SOCKET")
         .unwrap_or_else(|_| "/tmp/aegis-components.sock".into());
+    let session_token = std::env::var("AEGIS_SESSION_TOKEN").unwrap_or_default();
 
-    let mut cfg = Config::new(socket_path, "", "market_data");
+    let mut cfg = Config::new(socket_path, session_token, "market_data");
     cfg.version              = "0.1.0".into();
     cfg.supported_symbols    = vec!["BTCUSDT".into(), "ETHUSDT".into()];
     cfg.supported_timeframes = vec!["1m".into(), "5m".into()];
@@ -360,19 +321,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let component = Component::new(cfg, ComponentHandlerImpl::new(mode));
+    let component = Component::new(cfg, FusionHandler::new(mode));
 
     tokio::select! {
         res = component.run() => {
             if let Err(e) = res {
-                eprintln!("component stopped with error: {e}");
+                eprintln!("component error: {e}");
                 std::process::exit(1);
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("ctrl-c — shutting down");
-        }
+        _ = tokio::signal::ctrl_c() => { info!("ctrl-c — shutting down"); }
     }
-
     Ok(())
 }

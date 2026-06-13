@@ -10,46 +10,67 @@ use std::time::Duration;
 /// or speeds inside `requires_streams`** — those belong in their
 /// dedicated fields.
 ///
-/// | `requires_streams` entry | Extra field used          | Resulting topic              |
-/// |--------------------------|---------------------------|------------------------------|
-/// | `"aggTrades"`            | `supported_symbols`       | `aggTrades.BTCUSDT`          |
-/// | `"trades"`               | `supported_symbols`       | `trades.BTCUSDT`             |
-/// | `"klines"`               | `supported_symbols`       | `klines.BTCUSDT.1m`          |
-/// |                          | + `supported_timeframes`  |                              |
-/// | `"orderBook"`            | `supported_symbols`       | `orderBook.BTCUSDT.100ms`    |
-/// |                          | + `supported_orderbook_speeds` |                         |
-/// | `"bookDepth"`            | `supported_symbols`       | `bookDepth.BTCUSDT`          |
-/// | `"metrics"`              | `supported_symbols`       | `metrics.BTCUSDT`            |
+/// | `requires_streams` entry   | Extra field used               | Resulting topic           |
+/// |----------------------------|--------------------------------|---------------------------|
+/// | `"aggTrades"`              | `supported_symbols`            | `aggTrades.BTCUSDT`       |
+/// | `"trades"`                 | `supported_symbols`            | `trades.BTCUSDT`          |
+/// | `"klines"`                 | `supported_symbols`            | `klines.BTCUSDT.1m`       |
+/// |                            | + `supported_timeframes`       |                           |
+/// | `"orderBook"`              | `supported_symbols`            | `orderBook.BTCUSDT.100ms` |
+/// |                            | + `supported_orderbook_speeds` |                           |
+/// | `"bookDepth"`              | `supported_symbols`            | `bookDepth.BTCUSDT`       |
+/// | `"metrics"`                | `supported_symbols`            | `metrics.BTCUSDT`         |
 #[derive(Debug, Clone)]
 pub struct Config {
-    // Connection
+    // ── Connection ───────────────────────────────────────────────────────────
+    /// Path to the Aegis component manager Unix socket.
+    /// Defaults to the `AEGIS_SOCKET` env var when empty.
     pub socket_path: String,
- 
-    // Identity
+
+    // ── Identity ─────────────────────────────────────────────────────────────
+    /// Session ID used as the registration token.
+    /// Defaults to the `AEGIS_SESSION_TOKEN` env var when empty.
     pub session_token:  String,
     pub component_name: String,
     pub version:        String,
- 
-    // Capabilities
-    pub supported_symbols:         Vec<String>,
-    pub supported_timeframes:      Vec<String>,
-    /// Update speeds for the orderBook stream.
+
+    // ── Capabilities ─────────────────────────────────────────────────────────
+    pub supported_symbols:          Vec<String>,
+    pub supported_timeframes:       Vec<String>,
+    /// Update speeds for the `orderBook` stream.
     /// Valid values: `"100ms"`, `"250ms"`, `"500ms"`.
     /// Defaults to `["100ms"]` when empty and `requires_streams` contains `"orderBook"`.
     pub supported_orderbook_speeds: Vec<String>,
-    /// Stream names only — no symbols, timeframes, or speeds.
+    /// Stream type names only — no symbols, timeframes, or speeds.
     /// Example: `vec!["aggTrades", "klines", "orderBook"]`
-    pub requires_streams:          Vec<String>,
- 
-    // Reconnection
+    pub requires_streams:           Vec<String>,
+
+    // ── Reconnection ─────────────────────────────────────────────────────────
     pub reconnect:              bool,
     pub reconnect_delay:        Duration,
     pub max_reconnect_delay:    Duration,
-    pub max_reconnect_attempts: u32, // 0 = unlimited
+    /// Maximum reconnect attempts. `0` means unlimited.
+    pub max_reconnect_attempts: u32,
+
+    // ── Heartbeat ────────────────────────────────────────────────────────────
+    /// Maximum time allowed between two consecutive PINGs from the daemon
+    /// before the connection is considered dead and a reconnect is triggered.
+    ///
+    /// The Aegis daemon sends a PING every `HeartbeatMonitorInterval` (5s) to
+    /// each `RUNNING`/`WAITING` component. Set this to at least 2× that
+    /// interval to absorb normal scheduling jitter.
+    ///
+    /// Default: 25s. Set to `Duration::ZERO` to disable the watchdog entirely
+    /// (not recommended for production).
+    pub ping_timeout: Duration,
 }
- 
 
 impl Config {
+    /// Create a new `Config` with sensible defaults.
+    ///
+    /// `socket_path` and `session_token` fall back to the `AEGIS_SOCKET` /
+    /// `AEGIS_SESSION_TOKEN` environment variables injected by the Aegis daemon.
+    /// Pass empty strings to use the env vars.
     pub fn new(
         socket_path:    impl Into<String>,
         session_token:  impl Into<String>,
@@ -68,6 +89,7 @@ impl Config {
             reconnect_delay:              Duration::from_secs(3),
             max_reconnect_delay:          Duration::from_secs(60),
             max_reconnect_attempts:       0,
+            ping_timeout:                 Duration::from_secs(25),
         }
     }
 }

@@ -16,6 +16,6 @@ pub enum AegisError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("read timeout")]
+    #[error("timeout waiting for daemon response")]
     Timeout,
 }

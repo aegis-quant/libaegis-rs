@@ -53,7 +53,7 @@ impl std::fmt::Display for ComponentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = serde_json::to_value(self)
             .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
         write!(f, "{}", s)
     }
@@ -76,9 +76,9 @@ pub struct Envelope {
 impl Envelope {
     pub fn new(
         msg_type: MessageType,
-        command: Command,
-        source: impl Into<String>,
-        payload: HashMap<String, serde_json::Value>,
+        command:  Command,
+        source:   impl Into<String>,
+        payload:  HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION.to_string(),
